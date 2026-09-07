@@ -15,6 +15,13 @@ import streamlit as st
 import requests
 from datetime import date, datetime
 
+# ── Chatbot module (graceful import so dashboard works even if not installed) ──
+try:
+    from chatbot import ask_chatbot, build_db_context as _build_ctx
+    _CHATBOT_AVAILABLE = True
+except ImportError:
+    _CHATBOT_AVAILABLE = False
+
 # ─── Config ───────────────────────────────────────────────────────────────────
 
 DB_PATH = "projectdb.sqlite"
@@ -133,6 +140,36 @@ def load_risks():
     return df
 
 
+# ─── Direct SQLite Write Helpers (no FastAPI needed) ──────────────────────────
+
+def db_update_financials(project_id: int, budget: float, actual_cost: float, revenue: float, notes: str = ""):
+    """Update or insert financial data directly into SQLite."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM financial_logs WHERE project_id = ? ORDER BY id DESC LIMIT 1", (project_id,))
+    row = cur.fetchone()
+    if row:
+        cur.execute(
+            "UPDATE financial_logs SET budget=?, actual_cost=?, revenue=?, notes=? WHERE id=?",
+            (budget, actual_cost, revenue, notes, row[0])
+        )
+    else:
+        cur.execute(
+            "INSERT INTO financial_logs (project_id, budget, actual_cost, revenue, notes, logged_at) VALUES (?,?,?,?,?,datetime('now'))",
+            (project_id, budget, actual_cost, revenue, notes)
+        )
+    conn.commit()
+    conn.close()
+
+
+def db_update_project_status(project_id: int, status: str):
+    """Update project status directly in SQLite."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE projects SET status=?, updated_at=datetime('now') WHERE id=?", (status.upper(), project_id))
+    conn.commit()
+    conn.close()
+
+
 def risk_level_from_matrix(prob, impact):
     matrix = {
         ("low","low"):"low", ("low","medium"):"low", ("low","high"):"medium", ("low","critical"):"medium",
@@ -183,7 +220,7 @@ with st.sidebar:
 
     page = st.radio(
         "Navigation",
-        ["🏠 Overview Dashboard", "📁 All Projects", "🔍 Project Detail", "💰 Financials", "⚠️ Risk Heatmap", "➕ Add Project"],
+        ["🏠 Overview Dashboard", "📁 All Projects", "🔍 Project Detail", "💰 Financials", "⚠️ Risk Heatmap", "➕ Add Project", "✏️ Edit KPIs", "🤖 AI Chatbot"],
         label_visibility="collapsed",
     )
 
@@ -720,6 +757,262 @@ elif page == "⚠️ Risk Heatmap":
                 margin=dict(t=10, b=80),
             )
             st.plotly_chart(fig_stacked, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE: ADD PROJECT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE: EDIT KPIs
+# ═══════════════════════════════════════════════════════════════════════════════
+
+elif page == "✏️ Edit KPIs":
+    st.markdown("# ✏️ Edit KPIs & Financial Data")
+    st.markdown(
+        "Edit budgets, costs, revenues, and project status directly. "
+        "Changes are **saved instantly to the database** and the 🤖 AI Chatbot will reflect them immediately."
+    )
+    st.markdown("---")
+
+    if projects_df.empty:
+        st.warning("No projects found.")
+        st.stop()
+
+    # ── Build editable dataframe ───────────────────────────────────────────
+    STATUS_OPTIONS = ["PLANNING", "ACTIVE", "ON_HOLD", "COMPLETED", "CANCELLED"]
+
+    # Merge project + financial data for editing
+    edit_df = projects_df[["id", "name", "client", "status"]].copy()
+    if not financials_df.empty:
+        fin_cols = financials_df[["project_id", "budget", "actual_cost", "revenue", "notes"]].copy()
+        edit_df = edit_df.merge(fin_cols, left_on="id", right_on="project_id", how="left").drop(columns=["project_id"])
+    else:
+        edit_df["budget"] = 0.0
+        edit_df["actual_cost"] = 0.0
+        edit_df["revenue"] = 0.0
+        edit_df["notes"] = ""
+
+    edit_df["notes"] = edit_df["notes"].fillna("")
+    edit_df = edit_df.rename(columns={
+        "id": "ID", "name": "Project", "client": "Client",
+        "status": "Status", "budget": "Budget ($)",
+        "actual_cost": "Actual Cost ($)", "revenue": "Revenue ($)",
+        "notes": "Notes"
+    })
+
+    # Compute read-only derived columns for reference
+    edit_df["Profit Margin (%)"] = (
+        (edit_df["Revenue ($)"] - edit_df["Actual Cost ($)"]) /
+        edit_df["Revenue ($)"].replace(0, 1) * 100
+    ).round(1)
+    edit_df["Budget Used (%)"] = (
+        edit_df["Actual Cost ($)"] / edit_df["Budget ($)"].replace(0, 1) * 100
+    ).round(1)
+
+    st.info("📝 Click any cell to edit. Press **Save Changes** when done.")
+
+    edited = st.data_editor(
+        edit_df,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        column_config={
+            "ID": st.column_config.NumberColumn("ID", disabled=True, width="small"),
+            "Project": st.column_config.TextColumn("Project", disabled=True, width="medium"),
+            "Client": st.column_config.TextColumn("Client", disabled=True, width="medium"),
+            "Status": st.column_config.SelectboxColumn(
+                "Status", options=STATUS_OPTIONS, width="small"
+            ),
+            "Budget ($)": st.column_config.NumberColumn(
+                "Budget ($)", min_value=0, format="$%d", step=1000, width="medium"
+            ),
+            "Actual Cost ($)": st.column_config.NumberColumn(
+                "Actual Cost ($)", min_value=0, format="$%d", step=1000, width="medium"
+            ),
+            "Revenue ($)": st.column_config.NumberColumn(
+                "Revenue ($)", min_value=0, format="$%d", step=1000, width="medium"
+            ),
+            "Notes": st.column_config.TextColumn("Notes", width="large"),
+            "Profit Margin (%)": st.column_config.NumberColumn(
+                "Margin %", disabled=True, format="%.1f%%", width="small"
+            ),
+            "Budget Used (%)": st.column_config.NumberColumn(
+                "Budget Used %", disabled=True, format="%.1f%%", width="small"
+            ),
+        },
+        key="kpi_editor",
+    )
+
+    st.markdown("---")
+    col_save, col_reset, _ = st.columns([1, 1, 4])
+
+    with col_save:
+        save_clicked = st.button("💾 Save Changes", type="primary", use_container_width=True)
+    with col_reset:
+        if st.button("↩️ Discard", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+
+    if save_clicked:
+        errors = []
+        saved_count = 0
+
+        for _, orig_row in edit_df.iterrows():
+            pid = int(orig_row["ID"])
+            new_row = edited[edited["ID"] == pid].iloc[0]
+
+            # ── Update financials if changed ──────────────────────────────
+            fin_changed = (
+                orig_row["Budget ($)"] != new_row["Budget ($)"] or
+                orig_row["Actual Cost ($)"] != new_row["Actual Cost ($)"] or
+                orig_row["Revenue ($)"] != new_row["Revenue ($)"] or
+                orig_row["Notes"] != new_row["Notes"]
+            )
+            if fin_changed:
+                try:
+                    db_update_financials(
+                        project_id=pid,
+                        budget=float(new_row["Budget ($)"] or 0),
+                        actual_cost=float(new_row["Actual Cost ($)"] or 0),
+                        revenue=float(new_row["Revenue ($)"] or 0),
+                        notes=str(new_row["Notes"] or ""),
+                    )
+                    saved_count += 1
+                except Exception as e:
+                    errors.append(f"Financial update failed for '{orig_row['Project']}': {e}")
+
+            # ── Update project status if changed ──────────────────────────
+            if orig_row["Status"] != new_row["Status"]:
+                try:
+                    db_update_project_status(pid, str(new_row["Status"]))
+                    saved_count += 1
+                except Exception as e:
+                    errors.append(f"Status update failed for '{orig_row['Project']}': {e}")
+
+        if errors:
+            for err in errors:
+                st.error(err)
+        elif saved_count == 0:
+            st.info("No changes detected.")
+        else:
+            st.success(
+                f"✅ **{saved_count} update(s) saved to database!** "
+                "The 🤖 AI Chatbot will now reflect the updated figures."
+            )
+            st.cache_data.clear()
+            st.rerun()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE: AI CHATBOT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+elif page == "🤖 AI Chatbot":
+
+    st.markdown("# 🤖 AI Project Assistant")
+    st.markdown("Ask anything about your projects, financials, team, or risks. "
+                "Answers are grounded in real-time dashboard data.")
+    st.markdown("---")
+
+    if not _CHATBOT_AVAILABLE:
+        st.error(
+            "**chatbot.py not found or has import errors.**\n\n"
+            "Make sure `chatbot.py` is in the same directory as `dashboard.py` "
+            "and that all dependencies are installed:\n\n"
+            "```bash\npip install google-generativeai\n```"
+        )
+        st.stop()
+
+    import os
+    from dotenv import load_dotenv
+    load_dotenv()
+    _key_set = bool(os.getenv("GEMINI_API_KEY", "").strip())
+
+    if not _key_set:
+        st.warning(
+            "**GEMINI_API_KEY not set.**\n\n"
+            "1. Get a free key at https://aistudio.google.com/app/apikey\n"
+            "2. Open `.env` and set: `GEMINI_API_KEY=<your-key>`\n"
+            "3. Restart the Streamlit app"
+        )
+        st.stop()
+
+    # ── Example prompts ───────────────────────────────────────────────────
+    with st.expander("💡 Example questions you can ask", expanded=False):
+        ex_cols = st.columns(2)
+        examples_left = [
+            "Which project has the highest profit margin?",
+            "How many open risks are there across all projects?",
+            "Which projects are currently on hold?",
+            "What is the total portfolio revenue?",
+        ]
+        examples_right = [
+            "Which project is most over budget?",
+            "List all critical risks and their owners.",
+            "Who are the project leads across all projects?",
+            "Compare budget utilization across all projects.",
+        ]
+        with ex_cols[0]:
+            for ex in examples_left:
+                if st.button(ex, key=f"ex_{ex[:20]}", use_container_width=True):
+                    st.session_state.setdefault("chat_messages", [])
+                    st.session_state["chat_prefill"] = ex
+        with ex_cols[1]:
+            for ex in examples_right:
+                if st.button(ex, key=f"ex_{ex[:20]}", use_container_width=True):
+                    st.session_state.setdefault("chat_messages", [])
+                    st.session_state["chat_prefill"] = ex
+
+    # ── Initialise session state ───────────────────────────────────────────
+    if "chat_messages" not in st.session_state:
+        st.session_state["chat_messages"] = []
+
+    # ── Clear conversation button ─────────────────────────────────────────
+    col_cl, _ = st.columns([1, 5])
+    with col_cl:
+        if st.button("🗑 Clear chat", key="clear_chat"):
+            st.session_state["chat_messages"] = []
+            st.rerun()
+
+    # ── Render existing messages ───────────────────────────────────────────
+    for msg in st.session_state["chat_messages"]:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # ── Handle prefilled question from example buttons ────────────────────
+    prefill = st.session_state.pop("chat_prefill", None)
+
+    # ── Chat input ────────────────────────────────────────────────────────
+    user_input = st.chat_input(
+        "Ask about your projects, financials, team, or risks…",
+        key="chat_input",
+    ) or prefill
+
+    if user_input:
+        # Display user message
+        st.session_state["chat_messages"].append({"role": "user", "content": user_input})
+        with st.chat_message("user"):
+            st.markdown(user_input)
+
+        # Call Gemini with full conversation history (excluding the just-added message)
+        history_for_api = st.session_state["chat_messages"][:-1]
+
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking…"):
+                try:
+                    answer = ask_chatbot(
+                        user_question=user_input,
+                        db_path=DB_PATH,
+                        chat_history=history_for_api,
+                    )
+                except ValueError as ve:
+                    answer = f"⚠️ Configuration error: {ve}"
+                except Exception as e:
+                    answer = f"❌ Unexpected error: {e}"
+            st.markdown(answer)
+
+        st.session_state["chat_messages"].append({"role": "assistant", "content": answer})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
